@@ -663,7 +663,6 @@ nav {
   position:fixed;
   inset:0;
   background:rgba(8,11,15,0.7);
-  display:flex;
   align-items:center;
   justify-content:center;
   z-index:200;
@@ -927,6 +926,7 @@ let state = {
   abortController: null,
   signals: [],
   prevSignalSet: new Set(),
+  isFirstScan: true,   // suppress popups on first scan — nothing is "new" yet
   dirFilter: 'all',
   liveEnabled: false,
   liveTimer: null,
@@ -1135,7 +1135,11 @@ function updateLiveStatus(status) {
 }
 
 function closePopup() {
+  if (popupTimer) { clearTimeout(popupTimer); popupTimer = null; }
   document.getElementById('signalPopup').classList.remove('visible');
+  popupShowing = false;
+  // Drain remaining queue after a moment
+  setTimeout(() => { if (popupQueue.length > 0) showNextPopup(); }, 400);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -2025,11 +2029,11 @@ async function startScan() {
       if (!stopRequested) await new Promise(r => setTimeout(r, CFG.SMC_KLINE_DELAY));
     }
 
-    // Detect new signals
-    const prevSet = state.prevSignalSet;
+    // Detect new signals — on the very first scan nothing is "new", just seed the set
     const currentIds = new Set(newSignals.map(s => s.id));
-    const brandNew = newSignals.filter(s => !prevSet.has(s.id));
+    const brandNew = state.isFirstScan ? [] : newSignals.filter(s => !state.prevSignalSet.has(s.id));
     state.prevSignalSet = currentIds;
+    state.isFirstScan = false;
     state.signals = newSignals;
 
     const longs = newSignals.filter(s => s.direction === 'LONG').length;
@@ -2105,13 +2109,16 @@ function endScan() {
 // ═══════════════════════════════════════════════════════════════════
 const popupQueue = [];
 let popupShowing = false;
+let popupTimer = null;
 
 function showPopup(sig) {
+  // Hard cap — never queue more than 5 popups at once
+  if (popupQueue.length >= 5) return;
   popupQueue.push(sig);
-  if (!popupShowing) processPopupQueue();
+  if (!popupShowing) showNextPopup();
 }
 
-function processPopupQueue() {
+function showNextPopup() {
   if (popupQueue.length === 0) { popupShowing = false; return; }
   popupShowing = true;
   const sig = popupQueue.shift();
@@ -2125,11 +2132,14 @@ function processPopupQueue() {
     Entry: ${sig.entry.toFixed(6)}<br>
     SL: ${sig.sl.toFixed(6)} | TP1: ${sig.tp1.toFixed(6)}<br>
     Indicators: ${sig.indicators.join(', ')}`;
-  setTimeout(() => {
+  if (popupTimer) clearTimeout(popupTimer);
+  popupTimer = setTimeout(() => {
     popup.classList.remove('visible');
-    setTimeout(processPopupQueue, 300);
-  }, 5000);
+    popupTimer = setTimeout(() => { showNextPopup(); }, 400);
+  }, 4000);
 }
+
+function processPopupQueue() {} // legacy stub — no longer used
 
 // ═══════════════════════════════════════════════════════════════════
 // RENDER
