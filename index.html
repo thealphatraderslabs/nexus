@@ -1823,26 +1823,23 @@ function calcConfluence(candles, mode, direction, barIndex) {
 }
 
 // Check entry condition for a given mode.
-// Simulates Pine Script's full state machine:
+// Matches Pine Script logic:
 //   1. Strip the live unconfirmed bar (barstate.isconfirmed)
-//   2. Walk back through candle history to simulate positionFlat / exitThresh / reEntryCooldown
-//      so we only fire when Pine would genuinely enter — not when it already entered+exited
+//   2. Current bar must meet all entry conditions
+//   3. Confluence must have crossed UP through entryThresh on this bar or recently —
+//      meaning it was below entryThresh at some point since the last time we could have entered.
+//      This prevents re-firing on a signal where confluence entered, dipped below exitThresh
+//      (CONF EXIT), then came back up — Pine would need a fresh cross to re-enter.
 function checkEntry(candlesRaw, mode) {
-  // Strip the live forming bar — use only fully closed bars (Pine: barstate.isconfirmed)
+  // Strip the live forming bar — only use fully closed bars (Pine: barstate.isconfirmed)
   const candles = candlesRaw.length > 1 ? candlesRaw.slice(0, -1) : candlesRaw;
   const p = getModeParams(mode);
   const n = candles.length;
   if (n < 50) return null;
 
-  // Pre-compute all indicator arrays once (expensive — done outside the bar loop)
-  const close = candles.map(c => c.close);
-  const high  = candles.map(c => c.high);
-  const low   = candles.map(c => c.low);
-
-  // ── FAST PATH: check current bar first ──
+  // ── Step 1: Check current bar entry conditions ──
   const bull = calcConfluence(candles, mode, 'bull');
   const bear = calcConfluence(candles, mode, 'bear');
-
   const relStrengthMargin = 10.0;
   const atr = bull.atr;
 
@@ -1853,128 +1850,92 @@ function checkEntry(candlesRaw, mode) {
   if (p.enableAO) enabledCount++;
   const effectiveMinSignal = Math.max(1, Math.min(p.minSignal, enabledCount));
 
-  const currentLongMet = (
+  const longOK = (
     bull.score >= p.entryThresh &&
     bull.count >= effectiveMinSignal &&
     bull.score > (bear.score + relStrengthMargin) &&
     bull.strongTrend
   );
-  const currentShortMet = (
+  const shortOK = (
     bear.score >= p.entryThresh &&
     bear.count >= effectiveMinSignal &&
     bear.score > (bull.score + relStrengthMargin) &&
     bear.strongTrend
   );
 
-  // If current bar doesn't meet entry conditions at all, bail immediately
-  if (!currentLongMet && !currentShortMet) return null;
+  if (!longOK && !shortOK) return null;
 
-  // ── STATE MACHINE: simulate Pine's position tracking over recent bars ──
-  // We walk the last N bars (enough to cover cooldown + exit confirmation)
-  // to determine if Pine would currently be in a position or have just exited.
-  //
-  // Pine entry gate: positionFlat AND confluenceCrossedAboveEntryThresh AND strongTrend
-  // Pine exit gate:  confluenceBelowExitThresh for exitBufferBars consecutive bars (before TP1)
-  //
-  // We simulate this by scanning backwards to find:
-  //   - The most recent bar where confluence crossed ABOVE entryThresh (entry trigger)
-  //   - Whether confluence subsequently dropped BELOW exitThresh for exitBufferBars bars (exit)
-  //   - If it exited, whether confluence has since crossed above entryThresh AGAIN (re-entry)
-  //
-  // Lookback: scan last 50 bars (covers all realistic trade durations on any timeframe)
-  const LOOKBACK = Math.min(50, n - 1);
+  const direction = longOK ? 'LONG' : 'SHORT';
+
+  // ── Step 2: Lookback check — did confluence dip below exitThresh recently? ──
+  // Pine's CONF EXIT fires after exitBufferBars consecutive bars below exitThresh.
+  // If that happened after the last entry, Pine is now FLAT and needs a fresh cross to re-enter.
+  // We check the last (exitBufferBars + cooldown + small buffer) bars.
+  // If we find exitBufferBars consecutive bars below exitThresh, it means Pine exited.
+  // After that exit we then check: did confluence cross back ABOVE entryThresh?
+  // If not — Pine is still flat post-exit but hasn't re-triggered, so we suppress.
+  // If yes — valid new entry.
+
   const exitBuffer = p.exitBufferBars || 5;
+  const cooldown = 5;
+  // Look back far enough to catch an exit + cooldown cycle
+  const lookback = exitBuffer + cooldown + 5;
+  const startBar = Math.max(1, n - 1 - lookback);
 
-  // Collect bull and bear scores for last LOOKBACK bars
-  // We reuse the already-computed indicator arrays — just re-evaluate the scoring logic
-  // for each bar index. This is cheaper than calling calcConfluence() LOOKBACK times.
-  const bullScores = new Array(n).fill(0);
-  const bearScores = new Array(n).fill(0);
-
-  // Only compute the bars we need (last LOOKBACK+exitBuffer bars)
-  const startBar = Math.max(0, n - 1 - LOOKBACK - exitBuffer);
+  // Collect confluence scores for the lookback window — only 10-15 bars, cheap
+  const scores = [];
   for (let b = startBar; b <= n - 1; b++) {
-    const bRes = calcConfluence(candles, mode, 'bull', b);
-    const brRes = calcConfluence(candles, mode, 'bear', b);
-    bullScores[b] = bRes.score;
-    bearScores[b] = brRes.score;
+    const res = calcConfluence(candles, mode, direction === 'LONG' ? 'bull' : 'bear', b);
+    scores.push({ bar: b, score: res.score });
   }
-  // Current bar is already computed
-  bullScores[n-1] = bull.score;
-  bearScores[n-1] = bear.score;
 
-  // Simulate state machine walking forward from startBar
-  // States: flat | long | short
-  let posState = 'flat';
-  let weakBarCount = 0;
-  let lastExitBar = -999;
-  const COOLDOWN = 5; // reEntryCooldown from Pine
+  // Walk forward through scores to detect: did an exit happen, and if so,
+  // has there been a fresh cross above entryThresh since?
+  let consecutiveWeak = 0;
+  let exitHappened = false;
+  let exitBar = -999;
+  let crossedAboveAfterExit = false;
 
-  for (let b = startBar; b <= n - 1; b++) {
-    const bBull = bullScores[b];
-    const bBear = bearScores[b];
-    const canReEnter = (b - lastExitBar) >= COOLDOWN;
+  for (let s = 0; s < scores.length; s++) {
+    const sc = scores[s].score;
+    const bar = scores[s].bar;
 
-    if (posState === 'flat') {
-      // Check entry
-      const bLongEntry = (
-        bBull >= p.entryThresh &&
-        bBull > (bBear + relStrengthMargin) &&
-        canReEnter
-      );
-      const bShortEntry = (
-        bBear >= p.entryThresh &&
-        bBear > (bBull + relStrengthMargin) &&
-        canReEnter
-      );
-      if (bLongEntry) { posState = 'long'; weakBarCount = 0; }
-      else if (bShortEntry) { posState = 'short'; weakBarCount = 0; }
-
-    } else if (posState === 'long') {
-      // Check confluence exit (Pine only exits before TP1 hit — we approximate: always check)
-      if (bBull < p.exitThresh) {
-        weakBarCount++;
-        if (weakBarCount >= exitBuffer) {
-          posState = 'flat';
-          lastExitBar = b;
-          weakBarCount = 0;
+    if (!exitHappened) {
+      // Looking for an exit event
+      if (sc < p.exitThresh) {
+        consecutiveWeak++;
+        if (consecutiveWeak >= exitBuffer) {
+          exitHappened = true;
+          exitBar = bar;
+          consecutiveWeak = 0;
         }
       } else {
-        weakBarCount = 0;
+        consecutiveWeak = 0;
       }
-
-    } else if (posState === 'short') {
-      if (bBear < p.exitThresh) {
-        weakBarCount++;
-        if (weakBarCount >= exitBuffer) {
-          posState = 'flat';
-          lastExitBar = b;
-          weakBarCount = 0;
-        }
-      } else {
-        weakBarCount = 0;
+    } else {
+      // Exit happened — now look for fresh cross above entryThresh (after cooldown)
+      if ((bar - exitBar) >= cooldown && sc >= p.entryThresh) {
+        crossedAboveAfterExit = true;
       }
     }
   }
 
-  // After simulation: if still in a position, Pine would NOT fire a new entry
-  if (posState !== 'flat') return null;
+  // If exit happened but no fresh cross above since → suppress (Pine is flat, not re-entered)
+  // If exit happened AND fresh cross happened → valid re-entry
+  // If no exit happened in the window → the current signal is the original still-active entry
+  //   (Pine is still in position) → suppress
+  if (exitHappened && !crossedAboveAfterExit) return null;
+  if (!exitHappened) {
+    // No exit detected in lookback — check if there was EVER an entry signal before current bar
+    // by looking for any bar that was above entryThresh in this window before the current bar.
+    // If confluence has been continuously above entryThresh this whole window, Pine entered
+    // on the first bar it went above and is still in that trade — suppress.
+    const anyPreviousEntry = scores.slice(0, -1).some(s => s.score >= p.entryThresh);
+    if (anyPreviousEntry) return null;
+    // If nothing in the lookback was above entryThresh — this IS the fresh cross. Allow it.
+  }
 
-  // Also check cooldown — if we just exited, enforce re-entry cooldown
-  if ((n - 1 - lastExitBar) < COOLDOWN) return null;
-
-  // Pine is flat and cooldown passed — entry is valid
-  const longEntry = currentLongMet;
-  const shortEntry = currentShortMet;
-
-  if (!longEntry && !shortEntry) return null;
-
-  const direction = longEntry ? 'LONG' : 'SHORT';
-  const confScore = longEntry ? bull.score : bear.score;
-  const indicators = longEntry ? bull.indicators : bear.indicators;
-  const count = longEntry ? bull.count : bear.count;
-
-  // SL/TP calculation — use scalar close price (close array is also in scope above)
+  // ── Step 3: Valid entry — compute SL/TP ──
   const closePrice = candles[n-1].close;
   const riskDist = atr * p.slAtrMult;
   const maxAllowedRisk = closePrice * 0.12;
@@ -1993,6 +1954,10 @@ function checkEntry(candlesRaw, mode) {
     tp3 = Math.max(closePrice * 0.70, closePrice - rd * p.tp3RR);
   }
 
+  const confScore = direction === 'LONG' ? bull.score : bear.score;
+  const indicators = direction === 'LONG' ? bull.indicators : bear.indicators;
+  const count = direction === 'LONG' ? bull.count : bear.count;
+
   return {
     direction, mode, confluence: confScore, count, indicators,
     entry: closePrice, sl, tp1, tp2, tp3,
@@ -2000,6 +1965,7 @@ function checkEntry(candlesRaw, mode) {
     atr, bullConf: bull.score, bearConf: bear.score
   };
 }
+
 
 // ═══════════════════════════════════════════════════════════════════
 // API LAYER
