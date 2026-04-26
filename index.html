@@ -1513,7 +1513,7 @@ function getModeParams(mode) {
     stochK: 14, stochD: 3, stochSmooth: 3,
     adxLength: 14, adxThreshold: 20.0,
     nviEmaLength: 255,
-    entryThresh: 55.0, exitThresh: 35.0, minSignal: 5,
+    entryThresh: 55.0, exitThresh: 35.0, minSignal: 5, exitBufferBars: 5,
     slAtrMult: 2.5, trailMult: 3.5,
     tp1RR: 1.5, tp2RR: 2.5, tp3RR: 3.5,
     // Weights
@@ -1535,7 +1535,7 @@ function getModeParams(mode) {
     adxLength: 10, adxThreshold: 15.0,
     pivotLength: 8, williamsLength: 14,
     stochK: 14, stochD: 3, stochSmooth: 3,
-    entryThresh: 50.0, exitThresh: 30.0, minSignal: 4,
+    entryThresh: 50.0, exitThresh: 30.0, minSignal: 4, exitBufferBars: 3,
     slAtrMult: 2.5, trailMult: 2.5,
     zlemaWeight: 15, rocWeight: 12, hurstWeight: 0,
     chopWeight: 0, rsiWeight: 12, rsiDivWeight: 15,
@@ -1560,7 +1560,7 @@ function getModeParams(mode) {
     stochK: 21, stochD: 5, stochSmooth: 5,
     adxLength: 20, adxThreshold: 25.0,
     nviEmaLength: 255,
-    entryThresh: 60.0, exitThresh: 40.0, minSignal: 8,
+    entryThresh: 60.0, exitThresh: 40.0, minSignal: 8, exitBufferBars: 6,
     slAtrMult: 2.5, trailMult: 4.5,
     zlemaWeight: 8, rocWeight: 6, hurstWeight: 15,
     chopWeight: 12, rsiWeight: 8, rsiDivWeight: 18,
@@ -1578,7 +1578,7 @@ function getModeParams(mode) {
 // ═══════════════════════════════════════════════════════════════════
 // CONFLUENCE ENGINE (EXACT LOGIC FROM PINE SCRIPT)
 // ═══════════════════════════════════════════════════════════════════
-function calcConfluence(candles, mode, direction) {
+function calcConfluence(candles, mode, direction, barIndex) {
   const p = getModeParams(mode);
   const n = candles.length;
   if (n < 50) return { score: 0, count: 0, indicators: [], atr: 0, stVal: 0, stDir: 0 };
@@ -1588,7 +1588,7 @@ function calcConfluence(candles, mode, direction) {
   const low   = candles.map(c => c.low);
   const vol   = candles.map(c => c.volume);
   const open  = candles.map(c => c.open);
-  const i = n - 1; // latest bar
+  const i = (barIndex !== undefined) ? barIndex : n - 1; // default: latest bar
 
   // All indicator calculations
   const zlema = calcZLEMA(close, p.zlemaLength);
@@ -1822,23 +1822,30 @@ function calcConfluence(candles, mode, direction) {
   return { score: confluence, count, indicators: fired, atr: atrCurr, strongTrend, stBull, stBear };
 }
 
-// Check entry condition for a given mode
-// NOTE: Drop the last candle (currently forming / unconfirmed bar) before all calculations.
-// Pine Script fires only on barstate.isconfirmed — the Binance API always includes a live
-// open candle as the final entry, which Pine would never act on yet.
+// Check entry condition for a given mode.
+// Simulates Pine Script's full state machine:
+//   1. Strip the live unconfirmed bar (barstate.isconfirmed)
+//   2. Walk back through candle history to simulate positionFlat / exitThresh / reEntryCooldown
+//      so we only fire when Pine would genuinely enter — not when it already entered+exited
 function checkEntry(candlesRaw, mode) {
-  // Always strip the live forming bar — use only fully closed bars (Pine: barstate.isconfirmed)
+  // Strip the live forming bar — use only fully closed bars (Pine: barstate.isconfirmed)
   const candles = candlesRaw.length > 1 ? candlesRaw.slice(0, -1) : candlesRaw;
   const p = getModeParams(mode);
+  const n = candles.length;
+  if (n < 50) return null;
+
+  // Pre-compute all indicator arrays once (expensive — done outside the bar loop)
+  const close = candles.map(c => c.close);
+  const high  = candles.map(c => c.high);
+  const low   = candles.map(c => c.low);
+
+  // ── FAST PATH: check current bar first ──
   const bull = calcConfluence(candles, mode, 'bull');
   const bear = calcConfluence(candles, mode, 'bear');
 
   const relStrengthMargin = 10.0;
-  const n = candles.length;
-  const close = candles[n-1].close;
   const atr = bull.atr;
 
-  // Enabled indicator count
   let enabledCount = 10;
   if (p.enableHurst) enabledCount++;
   if (p.enableChop) enabledCount++;
@@ -1846,18 +1853,119 @@ function checkEntry(candlesRaw, mode) {
   if (p.enableAO) enabledCount++;
   const effectiveMinSignal = Math.max(1, Math.min(p.minSignal, enabledCount));
 
-  const longEntry = (
+  const currentLongMet = (
     bull.score >= p.entryThresh &&
     bull.count >= effectiveMinSignal &&
     bull.score > (bear.score + relStrengthMargin) &&
     bull.strongTrend
   );
-  const shortEntry = (
+  const currentShortMet = (
     bear.score >= p.entryThresh &&
     bear.count >= effectiveMinSignal &&
     bear.score > (bull.score + relStrengthMargin) &&
     bear.strongTrend
   );
+
+  // If current bar doesn't meet entry conditions at all, bail immediately
+  if (!currentLongMet && !currentShortMet) return null;
+
+  // ── STATE MACHINE: simulate Pine's position tracking over recent bars ──
+  // We walk the last N bars (enough to cover cooldown + exit confirmation)
+  // to determine if Pine would currently be in a position or have just exited.
+  //
+  // Pine entry gate: positionFlat AND confluenceCrossedAboveEntryThresh AND strongTrend
+  // Pine exit gate:  confluenceBelowExitThresh for exitBufferBars consecutive bars (before TP1)
+  //
+  // We simulate this by scanning backwards to find:
+  //   - The most recent bar where confluence crossed ABOVE entryThresh (entry trigger)
+  //   - Whether confluence subsequently dropped BELOW exitThresh for exitBufferBars bars (exit)
+  //   - If it exited, whether confluence has since crossed above entryThresh AGAIN (re-entry)
+  //
+  // Lookback: scan last 50 bars (covers all realistic trade durations on any timeframe)
+  const LOOKBACK = Math.min(50, n - 1);
+  const exitBuffer = p.exitBufferBars || 5;
+
+  // Collect bull and bear scores for last LOOKBACK bars
+  // We reuse the already-computed indicator arrays — just re-evaluate the scoring logic
+  // for each bar index. This is cheaper than calling calcConfluence() LOOKBACK times.
+  const bullScores = new Array(n).fill(0);
+  const bearScores = new Array(n).fill(0);
+
+  // Only compute the bars we need (last LOOKBACK+exitBuffer bars)
+  const startBar = Math.max(0, n - 1 - LOOKBACK - exitBuffer);
+  for (let b = startBar; b <= n - 1; b++) {
+    const bRes = calcConfluence(candles, mode, 'bull', b);
+    const brRes = calcConfluence(candles, mode, 'bear', b);
+    bullScores[b] = bRes.score;
+    bearScores[b] = brRes.score;
+  }
+  // Current bar is already computed
+  bullScores[n-1] = bull.score;
+  bearScores[n-1] = bear.score;
+
+  // Simulate state machine walking forward from startBar
+  // States: flat | long | short
+  let posState = 'flat';
+  let weakBarCount = 0;
+  let lastExitBar = -999;
+  const COOLDOWN = 5; // reEntryCooldown from Pine
+
+  for (let b = startBar; b <= n - 1; b++) {
+    const bBull = bullScores[b];
+    const bBear = bearScores[b];
+    const canReEnter = (b - lastExitBar) >= COOLDOWN;
+
+    if (posState === 'flat') {
+      // Check entry
+      const bLongEntry = (
+        bBull >= p.entryThresh &&
+        bBull > (bBear + relStrengthMargin) &&
+        canReEnter
+      );
+      const bShortEntry = (
+        bBear >= p.entryThresh &&
+        bBear > (bBull + relStrengthMargin) &&
+        canReEnter
+      );
+      if (bLongEntry) { posState = 'long'; weakBarCount = 0; }
+      else if (bShortEntry) { posState = 'short'; weakBarCount = 0; }
+
+    } else if (posState === 'long') {
+      // Check confluence exit (Pine only exits before TP1 hit — we approximate: always check)
+      if (bBull < p.exitThresh) {
+        weakBarCount++;
+        if (weakBarCount >= exitBuffer) {
+          posState = 'flat';
+          lastExitBar = b;
+          weakBarCount = 0;
+        }
+      } else {
+        weakBarCount = 0;
+      }
+
+    } else if (posState === 'short') {
+      if (bBear < p.exitThresh) {
+        weakBarCount++;
+        if (weakBarCount >= exitBuffer) {
+          posState = 'flat';
+          lastExitBar = b;
+          weakBarCount = 0;
+        }
+      } else {
+        weakBarCount = 0;
+      }
+    }
+  }
+
+  // After simulation: if still in a position, Pine would NOT fire a new entry
+  if (posState !== 'flat') return null;
+
+  // Also check cooldown — if we just exited, enforce re-entry cooldown
+  if ((n - 1 - lastExitBar) < COOLDOWN) return null;
+
+  // Pine is flat and cooldown passed — entry is valid
+  const longEntry = currentLongMet;
+  const shortEntry = currentShortMet;
 
   if (!longEntry && !shortEntry) return null;
 
@@ -1866,27 +1974,28 @@ function checkEntry(candlesRaw, mode) {
   const indicators = longEntry ? bull.indicators : bear.indicators;
   const count = longEntry ? bull.count : bear.count;
 
-  // SL/TP calculation
+  // SL/TP calculation — use scalar close price (close array is also in scope above)
+  const closePrice = candles[n-1].close;
   const riskDist = atr * p.slAtrMult;
-  const maxAllowedRisk = close * 0.12;
-  const minAllowedRisk = close * 0.01;
+  const maxAllowedRisk = closePrice * 0.12;
+  const minAllowedRisk = closePrice * 0.01;
   const rd = Math.max(Math.min(riskDist, maxAllowedRisk), minAllowedRisk);
   let sl, tp1, tp2, tp3;
   if (direction === 'LONG') {
-    sl  = close - rd;
-    tp1 = close + rd * p.tp1RR;
-    tp2 = close + rd * p.tp2RR;
-    tp3 = close + rd * p.tp3RR;
+    sl  = closePrice - rd;
+    tp1 = closePrice + rd * p.tp1RR;
+    tp2 = closePrice + rd * p.tp2RR;
+    tp3 = closePrice + rd * p.tp3RR;
   } else {
-    sl  = close + rd;
-    tp1 = Math.max(close * 0.92, close - rd * p.tp1RR);
-    tp2 = Math.max(close * 0.85, close - rd * p.tp2RR);
-    tp3 = Math.max(close * 0.70, close - rd * p.tp3RR);
+    sl  = closePrice + rd;
+    tp1 = Math.max(closePrice * 0.92, closePrice - rd * p.tp1RR);
+    tp2 = Math.max(closePrice * 0.85, closePrice - rd * p.tp2RR);
+    tp3 = Math.max(closePrice * 0.70, closePrice - rd * p.tp3RR);
   }
 
   return {
     direction, mode, confluence: confScore, count, indicators,
-    entry: close, sl, tp1, tp2, tp3,
+    entry: closePrice, sl, tp1, tp2, tp3,
     tp1RR: p.tp1RR, tp2RR: p.tp2RR, tp3RR: p.tp3RR,
     atr, bullConf: bull.score, bearConf: bear.score
   };
