@@ -906,7 +906,7 @@ nav {
 const CFG = {
   BINANCE_FAPI : 'https://fapi.binance.com/fapi/v1',
   BYBIT_API    : 'https://api.bybit.com/v5/market',
-  KLINE_LIMIT  : 150,
+  KLINE_LIMIT  : 400,
   FETCH_TIMEOUT: 10000,
   SMC_KLINE_DELAY: 80,
 };
@@ -1134,13 +1134,19 @@ function closePopup() {
 // NEXUS INDICATOR MATH - PORTED FROM PINE SCRIPT
 // ═══════════════════════════════════════════════════════════════════
 
+// EMA — seeded with SMA of first `period` bars to match Pine's ta.ema behaviour
 function ema(arr, period) {
   const k = 2 / (period + 1);
-  let val = arr[0];
-  const out = [val];
-  for (let i = 1; i < arr.length; i++) {
+  const out = new Array(arr.length).fill(NaN);
+  if (arr.length < period) return out;
+  // Seed: SMA of first period values
+  let val = 0;
+  for (let i = 0; i < period; i++) val += arr[i];
+  val /= period;
+  out[period - 1] = val;
+  for (let i = period; i < arr.length; i++) {
     val = arr[i] * k + val * (1 - k);
-    out.push(val);
+    out[i] = val;
   }
   return out;
 }
@@ -1228,55 +1234,68 @@ function calcMACD(close, fast, slow, sig) {
   return { macdLine, sigLine, hist };
 }
 
-// Supertrend
+// Supertrend — matches Pine Script ta.supertrend exactly:
+// 1. ATR uses Wilder's RMA (alpha = 1/period), NOT standard EMA
+// 2. upperBand and lowerBand are tracked separately across bars (not merged into supertrend[i-1])
 function calcSupertrend(high, low, close, mult, atrPeriod) {
   const n = close.length;
-  const atrArr = new Array(n).fill(0);
-  // True Range
+
+  // Step 1: True Range
+  const tr = new Array(n).fill(0);
   for (let i = 1; i < n; i++) {
-    atrArr[i] = Math.max(
+    tr[i] = Math.max(
       high[i] - low[i],
       Math.abs(high[i] - close[i-1]),
       Math.abs(low[i] - close[i-1])
     );
   }
-  // ATR via EMA
-  const k = 2 / (atrPeriod + 1);
-  let atrVal = atrArr.slice(1, atrPeriod+1).reduce((a,b)=>a+b,0) / atrPeriod;
+
+  // Step 2: ATR via Wilder's RMA (alpha = 1/period) — Pine's ta.atr uses RMA, not EMA
   const atrSmooth = new Array(n).fill(0);
-  atrSmooth[atrPeriod] = atrVal;
-  for (let i = atrPeriod+1; i < n; i++) {
-    atrVal = atrArr[i] * k + atrVal * (1-k);
-    atrSmooth[i] = atrVal;
+  let rmaVal = 0;
+  for (let i = 1; i <= atrPeriod; i++) rmaVal += tr[i];
+  rmaVal /= atrPeriod;
+  atrSmooth[atrPeriod] = rmaVal;
+  const rmaK = 1 / atrPeriod;
+  for (let i = atrPeriod + 1; i < n; i++) {
+    rmaVal = rmaVal * (1 - rmaK) + tr[i] * rmaK;
+    atrSmooth[i] = rmaVal;
   }
+
+  // Step 3: Supertrend with separate band memory
   const supertrend = new Array(n).fill(0);
-  const direction = new Array(n).fill(1); // 1=bullish, -1=bearish
+  const direction  = new Array(n).fill(1); // 1 = bullish, -1 = bearish
+  const upperBands = new Array(n).fill(0);
+  const lowerBands = new Array(n).fill(0);
+
   for (let i = atrPeriod; i < n; i++) {
     const hl2 = (high[i] + low[i]) / 2;
-    const upperBasic = hl2 + mult * atrSmooth[i];
-    const lowerBasic = hl2 - mult * atrSmooth[i];
-    let upperBand = upperBasic;
-    let lowerBand = lowerBasic;
-    if (i > atrPeriod) {
-      const prevLower = supertrend[i-1] === supertrend[i-1] ? supertrend[i-1] : lowerBasic;
-      lowerBand = lowerBasic > prevLower || close[i-1] < prevLower ? lowerBasic : prevLower;
-      const prevUpper = supertrend[i-1] === supertrend[i-1] ? supertrend[i-1] : upperBasic;
-      upperBand = upperBasic < prevUpper || close[i-1] > prevUpper ? upperBasic : prevUpper;
-    }
+    const basicUpper = hl2 + mult * atrSmooth[i];
+    const basicLower = hl2 - mult * atrSmooth[i];
+
     if (i === atrPeriod) {
-      direction[i] = close[i] > hl2 ? 1 : -1;
-      supertrend[i] = direction[i] === 1 ? lowerBand : upperBand;
+      upperBands[i] = basicUpper;
+      lowerBands[i] = basicLower;
+      direction[i]  = close[i] <= basicUpper ? 1 : -1;
     } else {
-      if (supertrend[i-1] === (direction[i-1] === 1 ? supertrend[i-1] : supertrend[i-1])) {
-        if (direction[i-1] === 1) {
-          direction[i] = close[i] < lowerBand ? -1 : 1;
-        } else {
-          direction[i] = close[i] > upperBand ? 1 : -1;
-        }
+      // Pine: lowerBand := lowerBasic > lowerBand[1] || close[1] < lowerBand[1] ? lowerBasic : lowerBand[1]
+      lowerBands[i] = (basicLower > lowerBands[i-1] || close[i-1] < lowerBands[i-1])
+        ? basicLower : lowerBands[i-1];
+      // Pine: upperBand := upperBasic < upperBand[1] || close[1] > upperBand[1] ? upperBasic : upperBand[1]
+      upperBands[i] = (basicUpper < upperBands[i-1] || close[i-1] > upperBands[i-1])
+        ? basicUpper : upperBands[i-1];
+
+      // Direction flip logic (Pine exact)
+      if (direction[i-1] === 1) {
+        direction[i] = close[i] < lowerBands[i] ? -1 : 1;
+      } else {
+        direction[i] = close[i] > upperBands[i] ? 1 : -1;
       }
-      supertrend[i] = direction[i] === 1 ? lowerBand : upperBand;
     }
+
+    supertrend[i] = direction[i] === 1 ? lowerBands[i] : upperBands[i];
   }
+
   return { supertrend, direction };
 }
 
@@ -1421,19 +1440,25 @@ function calcNVI(close, volume) {
   return nvi;
 }
 
-// ATR
+// ATR — uses Wilder's RMA (alpha = 1/period) to match Pine's ta.atr exactly
 function calcATR(high, low, close, period) {
-  const tr = close.map((c,i) => {
-    if (i === 0) return high[i] - low[i];
-    return Math.max(high[i]-low[i], Math.abs(high[i]-close[i-1]), Math.abs(low[i]-close[i-1]));
-  });
-  const k = 2/(period+1);
-  let atr = tr.slice(0,period).reduce((a,b)=>a+b,0)/period;
-  return tr.map((_,i) => {
-    if (i < period) return tr.slice(0,i+1).reduce((a,b)=>a+b,0)/(i+1);
-    atr = tr[i]*k + atr*(1-k);
-    return atr;
-  });
+  const n = close.length;
+  const tr = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    tr[i] = i === 0
+      ? high[i] - low[i]
+      : Math.max(high[i]-low[i], Math.abs(high[i]-close[i-1]), Math.abs(low[i]-close[i-1]));
+  }
+  const out = new Array(n).fill(0);
+  // Seed: simple average of first `period` TRs (Wilder initialization)
+  let rma = tr.slice(0, period).reduce((a,b)=>a+b,0) / period;
+  out[period-1] = rma;
+  const k = 1 / period; // Wilder alpha
+  for (let i = period; i < n; i++) {
+    rma = rma * (1 - k) + tr[i] * k;
+    out[i] = rma;
+  }
+  return out;
 }
 
 // Pivot divergence detection (simplified)
@@ -1798,7 +1823,12 @@ function calcConfluence(candles, mode, direction) {
 }
 
 // Check entry condition for a given mode
-function checkEntry(candles, mode) {
+// NOTE: Drop the last candle (currently forming / unconfirmed bar) before all calculations.
+// Pine Script fires only on barstate.isconfirmed — the Binance API always includes a live
+// open candle as the final entry, which Pine would never act on yet.
+function checkEntry(candlesRaw, mode) {
+  // Always strip the live forming bar — use only fully closed bars (Pine: barstate.isconfirmed)
+  const candles = candlesRaw.length > 1 ? candlesRaw.slice(0, -1) : candlesRaw;
   const p = getModeParams(mode);
   const bull = calcConfluence(candles, mode, 'bull');
   const bear = calcConfluence(candles, mode, 'bear');
