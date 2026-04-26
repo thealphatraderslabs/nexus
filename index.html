@@ -1081,15 +1081,17 @@ function toggleLiveMonitor() {
     knob.style.background = 'var(--green)';
     document.getElementById('liveMonitorBar').classList.add('active');
     playSound('scan_start');
+    // If a scan already completed, schedule the next one immediately
+    if (!state.scanning && !state.isFirstScan) scheduleNextLiveScan();
   } else {
     wrap.style.background = 'var(--bg3)';
     wrap.style.borderColor = 'var(--border)';
     knob.style.left = '2px';
     knob.style.background = 'var(--muted)';
     document.getElementById('liveMonitorBar').classList.remove('active');
-    clearInterval(state.liveTimer);
-    clearInterval(state.liveCountdown);
-    state.liveTimer = null;
+    // Cancel any pending rescan
+    if (state.liveTimer) { clearTimeout(state.liveTimer); state.liveTimer = null; }
+    if (state.liveCountdown) { clearInterval(state.liveCountdown); state.liveCountdown = null; }
     playSound('tick');
   }
 }
@@ -2029,55 +2031,72 @@ async function startScan() {
       if (!stopRequested) await new Promise(r => setTimeout(r, CFG.SMC_KLINE_DELAY));
     }
 
-    // Detect new signals — on the very first scan nothing is "new", just seed the set
+    // ── STEP 1: Seed signal set (first scan = no new signals, just baseline) ──
     const currentIds = new Set(newSignals.map(s => s.id));
-    const brandNew = state.isFirstScan ? [] : newSignals.filter(s => !state.prevSignalSet.has(s.id));
+    const wasFirstScan = state.isFirstScan;
+    const brandNew = wasFirstScan ? [] : newSignals.filter(s => !state.prevSignalSet.has(s.id));
     state.prevSignalSet = currentIds;
     state.isFirstScan = false;
     state.signals = newSignals;
 
-    const longs = newSignals.filter(s => s.direction === 'LONG').length;
+    const longs  = newSignals.filter(s => s.direction === 'LONG').length;
     const shorts = newSignals.filter(s => s.direction === 'SHORT').length;
     const elapsed = ((Date.now() - state.scanStart) / 1000).toFixed(1) + 's';
 
+    log(
+      `Scan complete: ${newSignals.length} signals (${longs}L / ${shorts}S) in ${elapsed}` +
+      (wasFirstScan ? ' — baseline set, monitoring ready' : ` — ${brandNew.length} new`),
+      newSignals.length > 0 ? 'signal' : 'info'
+    );
+
+    // ── STEP 2: Dismiss overlay + re-enable UI FIRST ──
+    // Do this synchronously before any rendering so the browser can paint
+    dismissOverlay();
+
+    // ── STEP 3: Yield one frame so browser can actually paint the cleared overlay ──
+    await new Promise(r => requestAnimationFrame(() => setTimeout(r, 50)));
+
+    // ── STEP 4: Update stats & render results ──
     document.getElementById('statLong').textContent = longs;
     document.getElementById('statShort').textContent = shorts;
     document.getElementById('statNew').textContent = brandNew.length;
     document.getElementById('statTime').textContent = elapsed;
     document.getElementById('liveLastUpdate').textContent = `Last: ${new Date().toLocaleTimeString()}`;
+    playSound('scan_done');
+    renderSignals();
 
-    log(`Scan complete: ${newSignals.length} signals (${longs}L/${shorts}S) in ${elapsed}`, newSignals.length > 0 ? 'signal' : 'info');
-
-    // New signal alerts
-    for (const sig of brandNew) {
-      playSound(sig.direction === 'LONG' ? 'signal_long' : 'signal_short');
-      showPopup(sig);
-      log(`🔔 NEW SIGNAL: ${sig.symbol} ${sig.direction} [${sig.mode}] Conf:${sig.confluence.toFixed(0)}%`, sig.direction === 'LONG' ? 'signal' : 'signal-short');
+    // ── STEP 5: Fire new-signal alerts AFTER render, with a short delay so UI is responsive ──
+    if (brandNew.length > 0) {
       await new Promise(r => setTimeout(r, 300));
-    }
-
-    if (newSignals.length === 0) {
+      for (const sig of brandNew) {
+        playSound(sig.direction === 'LONG' ? 'signal_long' : 'signal_short');
+        showPopup(sig);
+        log(`🔔 NEW SIGNAL: ${sig.symbol} ${sig.direction} [${sig.mode}] Conf:${sig.confluence.toFixed(0)}%`,
+          sig.direction === 'LONG' ? 'signal' : 'signal-short');
+        await new Promise(r => setTimeout(r, 350));
+      }
+    } else if (newSignals.length === 0) {
       log('No signals found in this scan', 'warn');
     }
 
-    playSound('scan_done');
-    renderSignals();
+    // ── STEP 6: Schedule background monitor ONLY after everything is settled ──
+    scheduleNextLiveScan();
 
   } catch(e) {
     log(`Scan error: ${e.message}`, 'err');
     playSound('error');
+    dismissOverlay();
   }
-
-  endScan();
 }
 
 function stopScan() {
   stopRequested = true;
   log('Scan stopped by user', 'warn');
-  endScan();
+  dismissOverlay();
 }
 
-function endScan() {
+// Cleanly dismiss the scan overlay and re-enable controls — called as early as possible
+function dismissOverlay() {
   state.scanning = false;
   document.getElementById('scanBtn').disabled = false;
   document.getElementById('stopBtn').style.display = 'none';
@@ -2085,24 +2104,25 @@ function endScan() {
   document.getElementById('progressWrap').classList.remove('visible');
   document.getElementById('progressBar').style.width = '0%';
   updateLiveStatus(state.liveEnabled ? 'live' : 'idle');
-
-  // Start live monitor if enabled
-  if (state.liveEnabled && !state.liveTimer) {
-    const secs = parseInt(document.getElementById('rescanInterval').value);
-    startLiveCountdown();
-    state.liveTimer = setTimeout(function rescan() {
-      if (state.liveEnabled && !state.scanning) {
-        startScan().then(() => {
-          if (state.liveEnabled) {
-            const s2 = parseInt(document.getElementById('rescanInterval').value);
-            startLiveCountdown();
-            state.liveTimer = setTimeout(rescan, s2 * 1000);
-          }
-        });
-      }
-    }, secs * 1000);
-  }
 }
+
+// Schedule the next live rescan — only called after render is fully complete
+function scheduleNextLiveScan() {
+  if (!state.liveEnabled) return;
+  if (state.liveTimer) { clearTimeout(state.liveTimer); state.liveTimer = null; }
+  const secs = parseInt(document.getElementById('rescanInterval').value);
+  startLiveCountdown();
+  state.liveTimer = setTimeout(async function liveTick() {
+    if (!state.liveEnabled || state.scanning) return;
+    await startScan();
+    // startScan itself calls scheduleNextLiveScan at the end, so no recursion needed here
+  }, secs * 1000);
+}
+
+function endScan() {
+  // Legacy stub — logic moved into startScan completion block above
+}
+
 
 // ═══════════════════════════════════════════════════════════════════
 // POPUP
