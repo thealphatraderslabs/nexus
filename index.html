@@ -1096,20 +1096,6 @@ function toggleLiveMonitor() {
   }
 }
 
-function startLiveCountdown() {
-  if (state.liveCountdown) clearInterval(state.liveCountdown);
-  const totalSecs = parseInt(document.getElementById('rescanInterval').value);
-  let remaining = totalSecs;
-  const el = document.getElementById('liveNextScan');
-  state.liveCountdown = setInterval(() => {
-    const m = Math.floor(remaining / 60);
-    const s = remaining % 60;
-    el.textContent = `Next scan in ${m}:${String(s).padStart(2,'0')}`;
-    remaining--;
-    if (remaining < 0) remaining = totalSecs;
-  }, 1000);
-}
-
 function clearLog() {
   document.getElementById('logArea').innerHTML = '';
 }
@@ -1993,19 +1979,21 @@ async function startScan() {
     document.getElementById('statTotal').textContent = symbols.length;
     document.getElementById('scanStatusText').textContent = `Scanning ${symbols.length} instruments...`;
 
-    // Batch processing with concurrency limit
-    const BATCH = 5;
-    for (let b = 0; b < symbols.length; b += BATCH) {
+    // Sequential processing — one coin at a time.
+    // yield via setTimeout(0) after EVERY coin so the browser can repaint + stay alive.
+    // CPU is the bottleneck (15 indicator calcs per coin), not network.
+    for (let si = 0; si < symbols.length; si++) {
       if (stopRequested) break;
-      const batch = symbols.slice(b, b + BATCH);
-      await Promise.all(batch.map(async (sym) => {
-        if (stopRequested) return;
-        try {
-          const candles = await fetchKlines(sym, state.timeframe);
-          if (!candles || candles.length < 50) return;
+      const sym = symbols[si];
 
+      // Yield to browser before heavy computation
+      await new Promise(r => setTimeout(r, 0));
+      if (stopRequested) break;
+
+      try {
+        const candles = await fetchKlines(sym, state.timeframe);
+        if (candles && candles.length >= 50) {
           for (const m of modes) {
-            if (stopRequested) return;
             const result = checkEntry(candles, m);
             if (result) {
               newSignals.push({
@@ -2016,22 +2004,20 @@ async function startScan() {
               });
             }
           }
-        } catch(e) {
-          // Silent fail per coin
-        } finally {
-          state.processed++;
-          const pct = (state.processed / state.totalCoins) * 100;
-          document.getElementById('progressBar').style.width = pct + '%';
-          document.getElementById('scanCountText').textContent = state.processed;
-          document.getElementById('scanSubText').textContent = `Analyzed: ${sym}`;
-          if (state.processed % 20 === 0) playSound('tick');
         }
-      }));
-      // Small delay between batches to be kind to APIs
-      if (!stopRequested) await new Promise(r => setTimeout(r, CFG.SMC_KLINE_DELAY));
+      } catch(e) {
+        // Silent fail — rate limit, network error etc.
+      }
+
+      state.processed++;
+      const pct = (state.processed / state.totalCoins) * 100;
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('scanCountText').textContent = state.processed;
+      document.getElementById('scanSubText').textContent = `Analyzed: ${sym}`;
+      if (state.processed % 25 === 0) playSound('tick');
     }
 
-    // ── STEP 1: Seed signal set (first scan = no new signals, just baseline) ──
+    // ── PHASE 1 COMPLETE: Seed baseline, dismiss UI, show results ──
     const currentIds = new Set(newSignals.map(s => s.id));
     const wasFirstScan = state.isFirstScan;
     const brandNew = wasFirstScan ? [] : newSignals.filter(s => !state.prevSignalSet.has(s.id));
@@ -2043,43 +2029,47 @@ async function startScan() {
     const shorts = newSignals.filter(s => s.direction === 'SHORT').length;
     const elapsed = ((Date.now() - state.scanStart) / 1000).toFixed(1) + 's';
 
-    log(
-      `Scan complete: ${newSignals.length} signals (${longs}L / ${shorts}S) in ${elapsed}` +
-      (wasFirstScan ? ' — baseline set, monitoring ready' : ` — ${brandNew.length} new`),
-      newSignals.length > 0 ? 'signal' : 'info'
-    );
-
-    // ── STEP 2: Dismiss overlay + re-enable UI FIRST ──
-    // Do this synchronously before any rendering so the browser can paint
+    // Dismiss overlay synchronously — browser must paint this before anything else
     dismissOverlay();
 
-    // ── STEP 3: Yield one frame so browser can actually paint the cleared overlay ──
-    await new Promise(r => requestAnimationFrame(() => setTimeout(r, 50)));
+    // Give the browser two full frames to paint the cleared overlay and re-enable the button
+    await new Promise(r => setTimeout(r, 100));
 
-    // ── STEP 4: Update stats & render results ──
+    // Now safe to update stats and render cards
     document.getElementById('statLong').textContent = longs;
     document.getElementById('statShort').textContent = shorts;
-    document.getElementById('statNew').textContent = brandNew.length;
+    document.getElementById('statNew').textContent = wasFirstScan ? 0 : brandNew.length;
     document.getElementById('statTime').textContent = elapsed;
     document.getElementById('liveLastUpdate').textContent = `Last: ${new Date().toLocaleTimeString()}`;
+
     playSound('scan_done');
     renderSignals();
 
-    // ── STEP 5: Fire new-signal alerts AFTER render, with a short delay so UI is responsive ──
-    if (brandNew.length > 0) {
-      await new Promise(r => setTimeout(r, 300));
+    if (wasFirstScan) {
+      log(`Scan #1 complete — ${newSignals.length} signals found (${longs}L / ${shorts}S) in ${elapsed}. Baseline set.`, 'signal');
+      log(`Background monitor will start in 60 seconds if Live Monitor is ON.`, 'info');
+    } else {
+      log(`Rescan complete — ${newSignals.length} signals (${longs}L / ${shorts}S), ${brandNew.length} new, in ${elapsed}`, newSignals.length > 0 ? 'signal' : 'info');
+      // Fire new signal alerts — staggered, capped at 5
+      let alertCount = 0;
       for (const sig of brandNew) {
+        if (alertCount >= 5) break;
         playSound(sig.direction === 'LONG' ? 'signal_long' : 'signal_short');
         showPopup(sig);
-        log(`🔔 NEW SIGNAL: ${sig.symbol} ${sig.direction} [${sig.mode}] Conf:${sig.confluence.toFixed(0)}%`,
+        log(`🔔 NEW: ${sig.symbol} ${sig.direction} [${sig.mode}] ${sig.confluence.toFixed(0)}%`,
           sig.direction === 'LONG' ? 'signal' : 'signal-short');
-        await new Promise(r => setTimeout(r, 350));
+        alertCount++;
+        await new Promise(r => setTimeout(r, 400));
       }
-    } else if (newSignals.length === 0) {
-      log('No signals found in this scan', 'warn');
     }
 
-    // ── STEP 6: Schedule background monitor ONLY after everything is settled ──
+    if (newSignals.length === 0) {
+      log('No signals found in this scan.', 'warn');
+    }
+
+    // ── PHASE 2: Schedule background rescan — only if Live Monitor is ON ──
+    // Starts AFTER scan is fully complete and results are shown.
+    // Uses the interval setting (default 5 min). Min hardcoded floor of 60 seconds.
     scheduleNextLiveScan();
 
   } catch(e) {
@@ -2106,17 +2096,37 @@ function dismissOverlay() {
   updateLiveStatus(state.liveEnabled ? 'live' : 'idle');
 }
 
-// Schedule the next live rescan — only called after render is fully complete
+// Schedule the next live rescan.
+// Called only AFTER scan is fully complete and results are rendered.
+// Hard minimum of 60 seconds regardless of dropdown setting.
 function scheduleNextLiveScan() {
   if (!state.liveEnabled) return;
   if (state.liveTimer) { clearTimeout(state.liveTimer); state.liveTimer = null; }
-  const secs = parseInt(document.getElementById('rescanInterval').value);
-  startLiveCountdown();
-  state.liveTimer = setTimeout(async function liveTick() {
+  const rawSecs = parseInt(document.getElementById('rescanInterval').value) || 300;
+  const secs = Math.max(60, rawSecs); // never less than 60s
+  log(`Next background scan in ${secs}s...`, 'info');
+  startLiveCountdown(secs);
+  state.liveTimer = setTimeout(async () => {
     if (!state.liveEnabled || state.scanning) return;
     await startScan();
-    // startScan itself calls scheduleNextLiveScan at the end, so no recursion needed here
+    // startScan calls scheduleNextLiveScan at its own completion — no loop needed here
   }, secs * 1000);
+}
+
+function startLiveCountdown(totalSecs) {
+  if (!totalSecs) totalSecs = parseInt(document.getElementById('rescanInterval').value) || 300;
+  if (state.liveCountdown) clearInterval(state.liveCountdown);
+  let remaining = totalSecs;
+  const el = document.getElementById('liveNextScan');
+  const tick = () => {
+    const m = Math.floor(remaining / 60);
+    const s = remaining % 60;
+    el.textContent = `Next scan in ${m}:${String(s).padStart(2,'0')}`;
+    remaining--;
+    if (remaining < 0) { clearInterval(state.liveCountdown); state.liveCountdown = null; }
+  };
+  tick();
+  state.liveCountdown = setInterval(tick, 1000);
 }
 
 function endScan() {
